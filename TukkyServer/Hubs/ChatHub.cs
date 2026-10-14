@@ -22,10 +22,16 @@ public class RegisterResultDto
     public UserProfileDto? Profile { get; set; }
 }
 
-public class PendingMessageDto
+public class NetworkMessageDto
 {
+    public string MessageId { get; set; } = string.Empty;
     public string SenderTag { get; set; } = string.Empty;
+    public string TargetTag { get; set; } = string.Empty;
     public string Text { get; set; } = string.Empty;
+    public string MessageType { get; set; } = "text"; // text, photo, video, gif, voice
+    public string MediaBase64 { get; set; } = string.Empty;
+    public string FileExtension { get; set; } = string.Empty;
+    public double AudioDurationSeconds { get; set; }
 }
 
 public class ChatHub : Hub
@@ -33,7 +39,8 @@ public class ChatHub : Hub
     private const string DbFilePath = "users_db.json";
     private static readonly ConcurrentDictionary<string, UserProfileDto> UsersDb = LoadDatabase();
     private static readonly ConcurrentDictionary<string, string> OnlineUsers = new();
-    private static readonly ConcurrentDictionary<string, List<PendingMessageDto>> OfflineMessages = new();
+    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> OfflineMessages = new();
+    private static readonly ConcurrentDictionary<string, List<(string SenderTag, string MessageId)>> OfflineDeletions = new();
 
     private static ConcurrentDictionary<string, UserProfileDto> LoadDatabase()
     {
@@ -100,12 +107,22 @@ public class ChatHub : Hub
 
         Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Пользователь в сети: @{cleanTag} ({profile.RealName})");
 
+        // Выдаем накопленные сообщения
         if (OfflineMessages.TryRemove(cleanTag, out var pendingList))
         {
             foreach (var msg in pendingList)
             {
                 UsersDb.TryGetValue(msg.SenderTag, out var senderProfile);
-                await Clients.Caller.SendAsync("ReceiveMessageWithProfile", msg.SenderTag, msg.Text, senderProfile);
+                await Clients.Caller.SendAsync("ReceiveRichMessage", msg, senderProfile);
+            }
+        }
+
+        // Выдаем команды удаления, если кто-то удалил сообщения, пока телефон был оффлайн
+        if (OfflineDeletions.TryRemove(cleanTag, out var pendingDeletes))
+        {
+            foreach (var del in pendingDeletes)
+            {
+                await Clients.Caller.SendAsync("MessageDeleted", del.SenderTag, del.MessageId);
             }
         }
 
@@ -130,25 +147,59 @@ public class ChatHub : Hub
         return Task.FromResult<UserProfileDto?>(null);
     }
 
-    public async Task SendMessageToUser(string senderUsername, string targetUsername, string messageText)
+    // Универсальная отправка (текст, фото, видео, GIF, голосовые)
+    public async Task SendRichMessage(NetworkMessageDto message)
     {
-        string cleanSender = NormalizeTag(senderUsername);
-        string cleanTarget = NormalizeTag(targetUsername);
+        string cleanSender = NormalizeTag(message.SenderTag);
+        string cleanTarget = NormalizeTag(message.TargetTag);
+        message.SenderTag = cleanSender;
+        message.TargetTag = cleanTarget;
 
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Сообщение @{cleanSender} -> @{cleanTarget}: {messageText}");
+        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] [{message.MessageType}] @{cleanSender} -> @{cleanTarget}");
 
         UsersDb.TryGetValue(cleanSender, out var senderProfile);
 
         if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
         {
-            await Clients.Client(targetConnectionId).SendAsync("ReceiveMessageWithProfile", cleanSender, messageText, senderProfile);
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveRichMessage", message, senderProfile);
         }
         else
         {
-            var list = OfflineMessages.GetOrAdd(cleanTarget, _ => new List<PendingMessageDto>());
+            var list = OfflineMessages.GetOrAdd(cleanTarget, _ => new List<NetworkMessageDto>());
             lock (list)
             {
-                list.Add(new PendingMessageDto { SenderTag = cleanSender, Text = messageText });
+                list.Add(message);
+            }
+        }
+    }
+
+    // Удаление сообщения у собеседника ("Удалить у всех")
+    public async Task DeleteMessageForEveryone(string senderTag, string targetTag, string messageId)
+    {
+        string cleanSender = NormalizeTag(senderTag);
+        string cleanTarget = NormalizeTag(targetTag);
+
+        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Удаление у всех (ID: {messageId}) от @{cleanSender} у @{cleanTarget}");
+
+        // Если сообщение еще лежит в очереди недоставленных — удаляем его оттуда
+        if (OfflineMessages.TryGetValue(cleanTarget, out var pendingList))
+        {
+            lock (pendingList)
+            {
+                pendingList.RemoveAll(m => m.MessageId == messageId);
+            }
+        }
+
+        if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("MessageDeleted", cleanSender, messageId);
+        }
+        else
+        {
+            var delList = OfflineDeletions.GetOrAdd(cleanTarget, _ => new List<(string, string)>());
+            lock (delList)
+            {
+                delList.Add((cleanSender, messageId));
             }
         }
     }
