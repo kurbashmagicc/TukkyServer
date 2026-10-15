@@ -38,14 +38,11 @@ public class NetworkMessageDto
 public class ChatHub : Hub
 {
     private const string DbFilePath = "users_db.json";
-    private const string PendingFilePath = "pending_messages.json";
-    private static readonly object FileLock = new();
-
     private static readonly ConcurrentDictionary<string, UserProfileDto> UsersDb = LoadDatabase();
     private static readonly ConcurrentDictionary<string, string> OnlineUsers = new(StringComparer.OrdinalIgnoreCase);
-
-    // Очередь гарантированной доставки: сообщения хранятся здесь, пока телефон не пришлет AckMessage
-    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> PendingMessages = LoadPendingMessages();
+    
+    // Очередь гарантированной доставки: сообщения удаляются отсюда ТОЛЬКО после AckMessage от телефона
+    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> PendingMessages = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, List<(string SenderTag, string MessageId)>> OfflineDeletions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, HashSet<string>> OfflineReadReceipts = new(StringComparer.OrdinalIgnoreCase);
 
@@ -65,44 +62,14 @@ public class ChatHub : Hub
         return new ConcurrentDictionary<string, UserProfileDto>(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static ConcurrentDictionary<string, List<NetworkMessageDto>> LoadPendingMessages()
+    private static void SaveDatabase()
     {
         try
         {
-            if (File.Exists(PendingFilePath))
-            {
-                string json = File.ReadAllText(PendingFilePath);
-                var dict = JsonSerializer.Deserialize<Dictionary<string, List<NetworkMessageDto>>>(json);
-                if (dict != null)
-                    return new ConcurrentDictionary<string, List<NetworkMessageDto>>(dict, StringComparer.OrdinalIgnoreCase);
-            }
+            string json = JsonSerializer.Serialize(UsersDb);
+            File.WriteAllText(DbFilePath, json);
         }
         catch { }
-        return new ConcurrentDictionary<string, List<NetworkMessageDto>>(StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static void SaveDatabase()
-    {
-        lock (FileLock)
-        {
-            try
-            {
-                File.WriteAllText(DbFilePath, JsonSerializer.Serialize(UsersDb));
-            }
-            catch { }
-        }
-    }
-
-    private static void SavePendingMessages()
-    {
-        lock (FileLock)
-        {
-            try
-            {
-                File.WriteAllText(PendingFilePath, JsonSerializer.Serialize(PendingMessages));
-            }
-            catch { }
-        }
     }
 
     private static string NormalizeTag(string tag)
@@ -110,7 +77,7 @@ public class ChatHub : Hub
         return (tag ?? string.Empty).Trim().TrimStart('@').ToLowerInvariant();
     }
 
-    // Фоновый пинг + автоматическая досылка всех неподтвержденных сообщений
+    // Пинг от телефона + досылка всех неподтвержденных сообщений
     public async Task PingUser(string tag)
     {
         string cleanTag = NormalizeTag(tag);
@@ -121,23 +88,15 @@ public class ChatHub : Hub
         }
     }
 
-    // Подтверждение от телефона, что сообщение реально сохранено в память устройства
+    // Подтверждение от телефона, что сообщение реально получено и сохранено
     public Task AckMessage(string receiverTag, string messageId)
     {
         string cleanReceiver = NormalizeTag(receiverTag);
-        if (string.IsNullOrEmpty(cleanReceiver) || string.IsNullOrEmpty(messageId))
-            return Task.CompletedTask;
-
         if (PendingMessages.TryGetValue(cleanReceiver, out var list))
         {
-            bool removed = false;
             lock (list)
             {
-                removed = list.RemoveAll(m => m.MessageId == messageId) > 0;
-            }
-            if (removed)
-            {
-                SavePendingMessages();
+                list.RemoveAll(m => m.MessageId == messageId);
             }
         }
         return Task.CompletedTask;
@@ -175,8 +134,7 @@ public class ChatHub : Hub
         OnlineUsers[cleanTag] = Context.ConnectionId;
         SaveDatabase();
 
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Вход в аккаунт: @{cleanTag} ({existingUser.RealName})");
-
+        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Вход в аккаунт: @{cleanTag}");
         await DeliverPendingEventsAsync(cleanTag);
 
         return new RegisterResultDto { Success = true, Message = "OK", Profile = existingUser };
@@ -221,8 +179,7 @@ public class ChatHub : Hub
         OnlineUsers[cleanTag] = Context.ConnectionId;
         SaveDatabase();
 
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Пользователь в сети: @{cleanTag} ({profile.RealName})");
-
+        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] В сети: @{cleanTag} ({profile.RealName})");
         await DeliverPendingEventsAsync(cleanTag);
 
         return new RegisterResultDto { Success = true, Message = "OK", Profile = profile };
@@ -280,15 +237,12 @@ public class ChatHub : Hub
     {
         string cleanSender = NormalizeTag(message.SenderTag);
         string cleanTarget = NormalizeTag(message.TargetTag);
-        if (string.IsNullOrEmpty(cleanSender) || string.IsNullOrEmpty(cleanTarget)) return;
-
+        message.SenderTag = cleanSender;
+        message.TargetTag = cleanTarget;
         if (string.IsNullOrEmpty(message.MessageId))
             message.MessageId = Guid.NewGuid().ToString("N");
 
-        message.SenderTag = cleanSender;
-        message.TargetTag = cleanTarget;
-
-        // 1. Всегда кладем сообщение в очередь до получения подтверждения (AckMessage) от второго телефона
+        // 1. ВСЕГДА сначала сохраняем в очередь до подтверждения (AckMessage), чтобы ни одно сообщение не пропало!
         var list = PendingMessages.GetOrAdd(cleanTarget, _ => new List<NetworkMessageDto>());
         lock (list)
         {
@@ -297,13 +251,10 @@ public class ChatHub : Hub
                 list.Add(message);
             }
         }
-        SavePendingMessages();
-
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] [{message.MessageType}] @{cleanSender} -> @{cleanTarget}");
 
         UsersDb.TryGetValue(cleanSender, out var senderProfile);
 
-        // 2. Если получатель сейчас подключен — сразу пушим ему сообщение
+        // 2. Если получатель сейчас подключен — сразу толкаем ему сообщение
         if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
         {
             await Clients.Client(targetConnectionId).SendAsync("ReceiveRichMessage", message, senderProfile);
@@ -341,7 +292,6 @@ public class ChatHub : Hub
             {
                 pendingList.RemoveAll(m => m.MessageId == messageId);
             }
-            SavePendingMessages();
         }
 
         if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
@@ -364,7 +314,6 @@ public class ChatHub : Hub
         if (user.Key != null)
         {
             OnlineUsers.TryRemove(user.Key, out _);
-            Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Отключился: @{user.Key}");
         }
         return base.OnDisconnectedAsync(exception);
     }
