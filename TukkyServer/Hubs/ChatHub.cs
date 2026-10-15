@@ -38,9 +38,14 @@ public class NetworkMessageDto
 public class ChatHub : Hub
 {
     private const string DbFilePath = "users_db.json";
+    private const string PendingFilePath = "pending_messages.json";
+    private static readonly object FileLock = new();
+
     private static readonly ConcurrentDictionary<string, UserProfileDto> UsersDb = LoadDatabase();
     private static readonly ConcurrentDictionary<string, string> OnlineUsers = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> OfflineMessages = new(StringComparer.OrdinalIgnoreCase);
+
+    // Очередь гарантированной доставки: сообщения хранятся здесь, пока телефон не пришлет AckMessage
+    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> PendingMessages = LoadPendingMessages();
     private static readonly ConcurrentDictionary<string, List<(string SenderTag, string MessageId)>> OfflineDeletions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, HashSet<string>> OfflineReadReceipts = new(StringComparer.OrdinalIgnoreCase);
 
@@ -60,14 +65,44 @@ public class ChatHub : Hub
         return new ConcurrentDictionary<string, UserProfileDto>(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static void SaveDatabase()
+    private static ConcurrentDictionary<string, List<NetworkMessageDto>> LoadPendingMessages()
     {
         try
         {
-            string json = JsonSerializer.Serialize(UsersDb);
-            File.WriteAllText(DbFilePath, json);
+            if (File.Exists(PendingFilePath))
+            {
+                string json = File.ReadAllText(PendingFilePath);
+                var dict = JsonSerializer.Deserialize<Dictionary<string, List<NetworkMessageDto>>>(json);
+                if (dict != null)
+                    return new ConcurrentDictionary<string, List<NetworkMessageDto>>(dict, StringComparer.OrdinalIgnoreCase);
+            }
         }
         catch { }
+        return new ConcurrentDictionary<string, List<NetworkMessageDto>>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static void SaveDatabase()
+    {
+        lock (FileLock)
+        {
+            try
+            {
+                File.WriteAllText(DbFilePath, JsonSerializer.Serialize(UsersDb));
+            }
+            catch { }
+        }
+    }
+
+    private static void SavePendingMessages()
+    {
+        lock (FileLock)
+        {
+            try
+            {
+                File.WriteAllText(PendingFilePath, JsonSerializer.Serialize(PendingMessages));
+            }
+            catch { }
+        }
     }
 
     private static string NormalizeTag(string tag)
@@ -75,18 +110,39 @@ public class ChatHub : Hub
         return (tag ?? string.Empty).Trim().TrimStart('@').ToLowerInvariant();
     }
 
-    // Фоновый пинг, чтобы Render не закрывал соединение, когда телефон свернут
-    public Task PingUser(string tag)
+    // Фоновый пинг + автоматическая досылка всех неподтвержденных сообщений
+    public async Task PingUser(string tag)
     {
         string cleanTag = NormalizeTag(tag);
         if (!string.IsNullOrEmpty(cleanTag))
         {
             OnlineUsers[cleanTag] = Context.ConnectionId;
+            await DeliverPendingEventsAsync(cleanTag);
+        }
+    }
+
+    // Подтверждение от телефона, что сообщение реально сохранено в память устройства
+    public Task AckMessage(string receiverTag, string messageId)
+    {
+        string cleanReceiver = NormalizeTag(receiverTag);
+        if (string.IsNullOrEmpty(cleanReceiver) || string.IsNullOrEmpty(messageId))
+            return Task.CompletedTask;
+
+        if (PendingMessages.TryGetValue(cleanReceiver, out var list))
+        {
+            bool removed = false;
+            lock (list)
+            {
+                removed = list.RemoveAll(m => m.MessageId == messageId) > 0;
+            }
+            if (removed)
+            {
+                SavePendingMessages();
+            }
         }
         return Task.CompletedTask;
     }
 
-    // Вход в существующий аккаунт по нику и паролю (восстановление после переустановки)
     public async Task<RegisterResultDto> LoginUser(string tag, string password, string currentDeviceId)
     {
         string cleanTag = NormalizeTag(tag);
@@ -100,13 +156,11 @@ public class ChatHub : Hub
             return new RegisterResultDto { Success = false, Message = $"Аккаунт @{cleanTag} не найден. Сначала зарегистрируйтесь." };
         }
 
-        // Если у аккаунта уже был задан пароль — проверяем его
         if (!string.IsNullOrEmpty(existingUser.Password) && existingUser.Password != password)
         {
             return new RegisterResultDto { Success = false, Message = "Неверный пароль от аккаунта!" };
         }
 
-        // Если аккаунт создавался в старой версии без пароля — сохраняем новый пароль
         if (string.IsNullOrEmpty(existingUser.Password) && !string.IsNullOrEmpty(password))
         {
             existingUser.Password = password;
@@ -140,7 +194,6 @@ public class ChatHub : Hub
             !string.IsNullOrEmpty(existingUser.UserId) &&
             existingUser.UserId != profile.UserId)
         {
-            Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Отказ: ник @{cleanTag} уже занят!");
             return new RegisterResultDto
             {
                 Success = false,
@@ -177,9 +230,15 @@ public class ChatHub : Hub
 
     private async Task DeliverPendingEventsAsync(string cleanTag)
     {
-        if (OfflineMessages.TryRemove(cleanTag, out var pendingList))
+        if (PendingMessages.TryGetValue(cleanTag, out var pendingList))
         {
-            foreach (var msg in pendingList)
+            List<NetworkMessageDto> snapshot;
+            lock (pendingList)
+            {
+                snapshot = pendingList.ToList();
+            }
+
+            foreach (var msg in snapshot)
             {
                 UsersDb.TryGetValue(msg.SenderTag, out var senderProfile);
                 await Clients.Caller.SendAsync("ReceiveRichMessage", msg, senderProfile);
@@ -221,28 +280,36 @@ public class ChatHub : Hub
     {
         string cleanSender = NormalizeTag(message.SenderTag);
         string cleanTarget = NormalizeTag(message.TargetTag);
+        if (string.IsNullOrEmpty(cleanSender) || string.IsNullOrEmpty(cleanTarget)) return;
+
+        if (string.IsNullOrEmpty(message.MessageId))
+            message.MessageId = Guid.NewGuid().ToString("N");
+
         message.SenderTag = cleanSender;
         message.TargetTag = cleanTarget;
+
+        // 1. Всегда кладем сообщение в очередь до получения подтверждения (AckMessage) от второго телефона
+        var list = PendingMessages.GetOrAdd(cleanTarget, _ => new List<NetworkMessageDto>());
+        lock (list)
+        {
+            if (!list.Any(m => m.MessageId == message.MessageId))
+            {
+                list.Add(message);
+            }
+        }
+        SavePendingMessages();
 
         Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] [{message.MessageType}] @{cleanSender} -> @{cleanTarget}");
 
         UsersDb.TryGetValue(cleanSender, out var senderProfile);
 
+        // 2. Если получатель сейчас подключен — сразу пушим ему сообщение
         if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
         {
             await Clients.Client(targetConnectionId).SendAsync("ReceiveRichMessage", message, senderProfile);
         }
-        else
-        {
-            var list = OfflineMessages.GetOrAdd(cleanTarget, _ => new List<NetworkMessageDto>());
-            lock (list)
-            {
-                list.Add(message);
-            }
-        }
     }
 
-    // Уведомление о том, что собеседник открыл и прочитал сообщения (две галочки ✓✓)
     public async Task MarkChatAsRead(string readerTag, string messageSenderTag)
     {
         string cleanReader = NormalizeTag(readerTag);
@@ -268,12 +335,13 @@ public class ChatHub : Hub
         string cleanSender = NormalizeTag(senderTag);
         string cleanTarget = NormalizeTag(targetTag);
 
-        if (OfflineMessages.TryGetValue(cleanTarget, out var pendingList))
+        if (PendingMessages.TryGetValue(cleanTarget, out var pendingList))
         {
             lock (pendingList)
             {
                 pendingList.RemoveAll(m => m.MessageId == messageId);
             }
+            SavePendingMessages();
         }
 
         if (OnlineUsers.TryGetValue(cleanTarget, out string? targetConnectionId))
