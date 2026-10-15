@@ -8,6 +8,7 @@ public class UserProfileDto
 {
     public string UserId { get; set; } = string.Empty;
     public string Tag { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
     public string RealName { get; set; } = string.Empty;
     public string Bio { get; set; } = string.Empty;
     public string Phone { get; set; } = string.Empty;
@@ -28,7 +29,7 @@ public class NetworkMessageDto
     public string SenderTag { get; set; } = string.Empty;
     public string TargetTag { get; set; } = string.Empty;
     public string Text { get; set; } = string.Empty;
-    public string MessageType { get; set; } = "text"; // text, photo, video, gif, voice
+    public string MessageType { get; set; } = "text";
     public string MediaBase64 { get; set; } = string.Empty;
     public string FileExtension { get; set; } = string.Empty;
     public double AudioDurationSeconds { get; set; }
@@ -38,9 +39,10 @@ public class ChatHub : Hub
 {
     private const string DbFilePath = "users_db.json";
     private static readonly ConcurrentDictionary<string, UserProfileDto> UsersDb = LoadDatabase();
-    private static readonly ConcurrentDictionary<string, string> OnlineUsers = new();
-    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> OfflineMessages = new();
-    private static readonly ConcurrentDictionary<string, List<(string SenderTag, string MessageId)>> OfflineDeletions = new();
+    private static readonly ConcurrentDictionary<string, string> OnlineUsers = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, List<NetworkMessageDto>> OfflineMessages = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, List<(string SenderTag, string MessageId)>> OfflineDeletions = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, HashSet<string>> OfflineReadReceipts = new(StringComparer.OrdinalIgnoreCase);
 
     private static ConcurrentDictionary<string, UserProfileDto> LoadDatabase()
     {
@@ -73,6 +75,59 @@ public class ChatHub : Hub
         return (tag ?? string.Empty).Trim().TrimStart('@').ToLowerInvariant();
     }
 
+    // Фоновый пинг, чтобы Render не закрывал соединение, когда телефон свернут
+    public Task PingUser(string tag)
+    {
+        string cleanTag = NormalizeTag(tag);
+        if (!string.IsNullOrEmpty(cleanTag))
+        {
+            OnlineUsers[cleanTag] = Context.ConnectionId;
+        }
+        return Task.CompletedTask;
+    }
+
+    // Вход в существующий аккаунт по нику и паролю (восстановление после переустановки)
+    public async Task<RegisterResultDto> LoginUser(string tag, string password, string currentDeviceId)
+    {
+        string cleanTag = NormalizeTag(tag);
+        if (string.IsNullOrEmpty(cleanTag))
+        {
+            return new RegisterResultDto { Success = false, Message = "Введите никнейм." };
+        }
+
+        if (!UsersDb.TryGetValue(cleanTag, out var existingUser))
+        {
+            return new RegisterResultDto { Success = false, Message = $"Аккаунт @{cleanTag} не найден. Сначала зарегистрируйтесь." };
+        }
+
+        // Если у аккаунта уже был задан пароль — проверяем его
+        if (!string.IsNullOrEmpty(existingUser.Password) && existingUser.Password != password)
+        {
+            return new RegisterResultDto { Success = false, Message = "Неверный пароль от аккаунта!" };
+        }
+
+        // Если аккаунт создавался в старой версии без пароля — сохраняем новый пароль
+        if (string.IsNullOrEmpty(existingUser.Password) && !string.IsNullOrEmpty(password))
+        {
+            existingUser.Password = password;
+        }
+
+        if (string.IsNullOrEmpty(existingUser.UserId))
+        {
+            existingUser.UserId = currentDeviceId;
+        }
+
+        UsersDb[cleanTag] = existingUser;
+        OnlineUsers[cleanTag] = Context.ConnectionId;
+        SaveDatabase();
+
+        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Вход в аккаунт: @{cleanTag} ({existingUser.RealName})");
+
+        await DeliverPendingEventsAsync(cleanTag);
+
+        return new RegisterResultDto { Success = true, Message = "OK", Profile = existingUser };
+    }
+
     public async Task<RegisterResultDto> RegisterOrUpdateUser(UserProfileDto profile)
     {
         string cleanTag = NormalizeTag(profile.Tag);
@@ -89,11 +144,19 @@ public class ChatHub : Hub
             return new RegisterResultDto
             {
                 Success = false,
-                Message = $"Ник @{cleanTag} уже занят другим пользователем!"
+                Message = $"Ник @{cleanTag} уже занят! Если это ваш аккаунт, переключитесь на вкладку «Вход»."
             };
         }
 
-        var oldEntries = UsersDb.Where(x => x.Value.UserId == profile.UserId && x.Key != cleanTag).ToList();
+        if (existingUser != null)
+        {
+            if (string.IsNullOrEmpty(profile.Password))
+                profile.Password = existingUser.Password;
+            if (string.IsNullOrEmpty(profile.AvatarBase64))
+                profile.AvatarBase64 = existingUser.AvatarBase64;
+        }
+
+        var oldEntries = UsersDb.Where(x => x.Value.UserId == profile.UserId && !x.Key.Equals(cleanTag, StringComparison.OrdinalIgnoreCase)).ToList();
         foreach (var old in oldEntries)
         {
             UsersDb.TryRemove(old.Key, out _);
@@ -107,7 +170,13 @@ public class ChatHub : Hub
 
         Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Пользователь в сети: @{cleanTag} ({profile.RealName})");
 
-        // Выдаем накопленные сообщения
+        await DeliverPendingEventsAsync(cleanTag);
+
+        return new RegisterResultDto { Success = true, Message = "OK", Profile = profile };
+    }
+
+    private async Task DeliverPendingEventsAsync(string cleanTag)
+    {
         if (OfflineMessages.TryRemove(cleanTag, out var pendingList))
         {
             foreach (var msg in pendingList)
@@ -117,7 +186,6 @@ public class ChatHub : Hub
             }
         }
 
-        // Выдаем команды удаления, если кто-то удалил сообщения, пока телефон был оффлайн
         if (OfflineDeletions.TryRemove(cleanTag, out var pendingDeletes))
         {
             foreach (var del in pendingDeletes)
@@ -126,28 +194,29 @@ public class ChatHub : Hub
             }
         }
 
-        return new RegisterResultDto { Success = true, Message = "OK", Profile = profile };
+        if (OfflineReadReceipts.TryRemove(cleanTag, out var readers))
+        {
+            foreach (var readerTag in readers)
+            {
+                await Clients.Caller.SendAsync("MessagesRead", readerTag);
+            }
+        }
     }
 
     public Task<UserProfileDto?> FindUser(string searchTag)
     {
         string cleanTag = NormalizeTag(searchTag);
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Поиск ника: @{cleanTag}");
-
         if (string.IsNullOrEmpty(cleanTag))
             return Task.FromResult<UserProfileDto?>(null);
 
         if (UsersDb.TryGetValue(cleanTag, out var user) && !user.IsPrivate)
         {
-            Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Найдено: @{cleanTag}");
             return Task.FromResult<UserProfileDto?>(user);
         }
 
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Не найдено: @{cleanTag}");
         return Task.FromResult<UserProfileDto?>(null);
     }
 
-    // Универсальная отправка (текст, фото, видео, GIF, голосовые)
     public async Task SendRichMessage(NetworkMessageDto message)
     {
         string cleanSender = NormalizeTag(message.SenderTag);
@@ -173,15 +242,32 @@ public class ChatHub : Hub
         }
     }
 
-    // Удаление сообщения у собеседника ("Удалить у всех")
+    // Уведомление о том, что собеседник открыл и прочитал сообщения (две галочки ✓✓)
+    public async Task MarkChatAsRead(string readerTag, string messageSenderTag)
+    {
+        string cleanReader = NormalizeTag(readerTag);
+        string cleanSender = NormalizeTag(messageSenderTag);
+        if (string.IsNullOrEmpty(cleanReader) || string.IsNullOrEmpty(cleanSender)) return;
+
+        if (OnlineUsers.TryGetValue(cleanSender, out string? senderConnectionId))
+        {
+            await Clients.Client(senderConnectionId).SendAsync("MessagesRead", cleanReader);
+        }
+        else
+        {
+            var set = OfflineReadReceipts.GetOrAdd(cleanSender, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            lock (set)
+            {
+                set.Add(cleanReader);
+            }
+        }
+    }
+
     public async Task DeleteMessageForEveryone(string senderTag, string targetTag, string messageId)
     {
         string cleanSender = NormalizeTag(senderTag);
         string cleanTarget = NormalizeTag(targetTag);
 
-        Console.WriteLine($"[КОНСОЛЬ СЕРВЕРА] Удаление у всех (ID: {messageId}) от @{cleanSender} у @{cleanTarget}");
-
-        // Если сообщение еще лежит в очереди недоставленных — удаляем его оттуда
         if (OfflineMessages.TryGetValue(cleanTarget, out var pendingList))
         {
             lock (pendingList)
