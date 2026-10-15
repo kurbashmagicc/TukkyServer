@@ -2,6 +2,11 @@ using TukkyServer.Hubs;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100 МБ
+});
+
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -13,10 +18,10 @@ builder.Services.AddCors(options =>
     });
 });
 
-// Увеличиваем лимит пакета до 30 МБ для пересылки фото, голосовых и видео
+// Лимит пакета SignalR — 100 МБ для тяжелых фото и видео
 builder.Services.AddSignalR(options =>
 {
-    options.MaximumReceiveMessageSize = 30 * 1024 * 1024;
+    options.MaximumReceiveMessageSize = 100 * 1024 * 1024;
 });
 
 var app = builder.Build();
